@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/pelletier/go-toml"
 	"github.com/syndtr/goleveldb/leveldb"
 	"io"
 	"mime/multipart"
-	"net/http"
+	. "net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"oss/utils"
@@ -17,14 +19,21 @@ import (
 	"time"
 )
 
+// 不可变参数
 const (
 	FileIndexPath   string = "/home/oss/index/"
+	ConfigPath      string = "/home/oss/config/"
+	ConfigFileName  string = "config.toml"
 	BaseStoragePath string = "/home/oss/storage/"
-	DefaultRate     int64  = 256 * 1024
 )
 
+// 配置文件参数
 var (
-	dbConn *leveldb.DB
+	dbConn             *leveldb.DB
+	config             *toml.Tree
+	addr                     = ":8000"
+	defaultRate        int64 = 256 << 10
+	defaultMaxFileSize int64 = 256 << 20
 )
 
 const UploadHtml string = `
@@ -54,29 +63,24 @@ type ResMsg struct {
 	Msg  string      `json:"msg"`
 }
 
-func ReturnJson(resMsg ResMsg, write http.ResponseWriter) {
+func ReturnJson(resMsg ResMsg, write ResponseWriter) {
 	// 返回JSON数据
 	resMsgJson, _ := json.Marshal(resMsg)
 	write.Header().Set("Content-Type", "application/json")
-	_, _ = write.Write(resMsgJson)
+	_, err := write.Write(resMsgJson)
+	fmt.Println(err)
 }
 
 // 上传文件页面
-func UploadHtmlHandler(writer http.ResponseWriter, request *http.Request) {
-	if request.Method == http.MethodGet {
+func UploadHtmlHandler(writer ResponseWriter, request *Request) {
+	if request.Method == MethodGet {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = writer.Write([]byte(UploadHtml))
 	}
 }
 
 // 上传文件
-func UploadHandler(writer http.ResponseWriter, request *http.Request) {
-	// 设置允许跨域访问
-	writer.Header().Set("Access-Control-Allow-Origin", "*")
-	writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, User-Agent, X-File-Size, X-Requested-With, X-Requested-By, If-Modified-Since, X-File-Name, X-File-Type, Cache-Control, Origin")
-	writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
-	writer.Header().Set("Access-Control-Expose-Headers", "Authorization")
-	// 可能需要校验用户信息
+func UploadHandler(writer ResponseWriter, request *Request) {
 	var (
 		err          error
 		project      string
@@ -87,7 +91,13 @@ func UploadHandler(writer http.ResponseWriter, request *http.Request) {
 		savePath     string
 		saveFile     *os.File
 	)
-	if request.Method == http.MethodPost {
+	// 设置允许跨域访问
+	writer.Header().Set("Access-Control-Allow-Origin", "*")
+	writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Depth, User-Agent, X-File-Size, X-Requested-With, X-Requested-By, If-Modified-Since, X-File-Name, X-File-Type, Cache-Control, Origin")
+	writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+	writer.Header().Set("Access-Control-Expose-Headers", "Authorization")
+	// 可能需要校验用户信息
+	if request.Method == MethodPost {
 		// 0.获取
 		project = request.FormValue("project")
 		if len(project) == 0 {
@@ -96,8 +106,16 @@ func UploadHandler(writer http.ResponseWriter, request *http.Request) {
 		}
 		module = request.FormValue("module")
 		// 1.获取文件信息
+		if err = request.ParseMultipartForm(32 << 20); err != nil {
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]上传文件失败，未知异常"}, writer)
+			return
+		}
+		if request.ContentLength > defaultMaxFileSize {
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]上传文件失败，文件过大"}, writer)
+			return
+		}
 		if uploadFile, uploadHeader, err = request.FormFile("file"); err != nil {
-			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]获取文件失败"}, writer)
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]上传文件失败，获取文件异常"}, writer)
 			return
 		}
 		defer uploadFile.Close()
@@ -111,7 +129,7 @@ func UploadHandler(writer http.ResponseWriter, request *http.Request) {
 			savePath = fmt.Sprintf(filePath+"%s", uploadHeader.Filename)
 		}
 		if _, err = os.Stat(savePath); err == nil { // 判断文件是否存在
-			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]文件名重复，请重新上传"}, writer)
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，文件名重复"}, writer)
 			return
 		}
 		if !utils.FileExists(filePath) { // 是否需要创建文件夹
@@ -119,13 +137,13 @@ func UploadHandler(writer http.ResponseWriter, request *http.Request) {
 		}
 		// 3.保存文件到本地目录
 		if saveFile, err = os.Create(savePath); err != nil {
-			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败1"}, writer)
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，打开文件异常"}, writer)
 			return
 		}
 		defer saveFile.Close()
 		buffer := make([]byte, 1024)
 		if _, err = io.CopyBuffer(saveFile, uploadFile, buffer); err != nil {
-			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败2"}, writer)
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，写入文件异常"}, writer)
 			return
 		}
 		// 4.保存文件路径和索引到数据库
@@ -144,7 +162,7 @@ func UploadHandler(writer http.ResponseWriter, request *http.Request) {
 }
 
 // 下载文件
-func DownloadHandler(writer http.ResponseWriter, request *http.Request) {
+func DownloadHandler(writer ResponseWriter, request *Request) {
 	var (
 		err      error
 		filePath []byte
@@ -177,7 +195,7 @@ func DownloadHandler(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Content-Disposition", "attachment; filename=\""+fileName+"\"")
 	writer.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
 	// 下载文件，默认限速255KB/s
-	bucket := ratelimit.New(DefaultRate)
+	bucket := ratelimit.New(defaultRate)
 	buffer := make([]byte, 1024)
 	if _, err = io.CopyBuffer(ratelimit.Writer(writer, bucket), file, buffer); err != nil {
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]下载文件出现异常"}, writer)
@@ -203,14 +221,74 @@ func SyncFileIndex() {
 	}
 }
 
+// 拷贝项目中的配置文件到指定位置
+func CreateExampleConfig() {
+	var (
+		err               error
+		exampleConfigFile *os.File
+		configFile        *os.File
+	)
+	if _, err = os.Stat(ConfigPath + ConfigFileName); err == nil {
+		return
+	}
+	if !utils.FileExists(ConfigPath) { // 是否需要创建文件夹
+		_ = os.MkdirAll(ConfigPath, 0775)
+	}
+	if exampleConfigFile, err = os.Open("./config/config.example.toml"); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+		return
+	}
+	defer exampleConfigFile.Close()
+	if configFile, err = os.Create(ConfigPath + ConfigFileName); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+		return
+	}
+	defer configFile.Close()
+	buffer := make([]byte, 1024)
+	if _, err = io.CopyBuffer(configFile, exampleConfigFile, buffer); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+		return
+	}
+}
+
+// 读取配置文件
+func ReadConfig(writer ResponseWriter, request *Request) {
+	var (
+		err error
+	)
+	if writer != nil && request != nil {
+		// 上传配置文件，再解析
+		ReturnJson(ResMsg{Code: 200, Data: nil, Msg: "[success]"}, writer)
+		return
+	} else {
+		// 拷贝项目中的配置文件进行解析
+		CreateExampleConfig()
+	}
+	config, err = toml.LoadFile(ConfigPath + ConfigFileName)
+	if err != nil {
+		fmt.Println("TomlError ", err.Error())
+		os.Exit(1)
+		return
+	}
+	addr = config.Get("app.addr").(string)
+	defaultRate = config.Get("app.defaultRate").(int64)
+	defaultMaxFileSize = config.Get("app.defaultMaxFileSize").(int64)
+	return
+}
+
 func main() {
 	// 读取配置文件
+	ReadConfig(nil, nil)
 	// 初始化数据库
 	dbConn, _ = leveldb.OpenFile(FileIndexPath, nil)
 	defer dbConn.Close()
 	// 初始化HTTP连接
-	http.HandleFunc("/oss/upload.html", UploadHtmlHandler)
-	http.HandleFunc("/oss/api/v1/upload", UploadHandler)
-	http.HandleFunc("/oss/api/v1/download/", DownloadHandler)
-	_ = http.ListenAndServe(":8000", nil)
+	HandleFunc("/oss/upload.html", UploadHtmlHandler)
+	HandleFunc("/oss/api/v1/syncConfig", ReadConfig)
+	HandleFunc("/oss/api/v1/upload", UploadHandler)
+	HandleFunc("/oss/api/v1/download/", DownloadHandler)
+	_ = ListenAndServe(addr, nil)
 }
