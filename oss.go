@@ -14,6 +14,7 @@ import (
 	"oss/utils"
 	"oss/utils/compress"
 	"oss/utils/ratelimit"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ var (
 	addr                     = ":8000"
 	defaultRate        int64 = 256 << 10
 	defaultMaxFileSize int64 = 256 << 20
+	rename             bool
 )
 
 const UploadHtml string = `
@@ -44,7 +46,7 @@ const UploadHtml string = `
 	<title>测试上传文件</title>
 </head>
 <body>
-<form action="http://localhost:8000/oss/api/v1/upload" method="post" enctype="multipart/form-data">
+<form action="/oss/api/v1/upload" method="post" enctype="multipart/form-data">
 	<label>项目名称（必填）:
 		<input type="text" name="project"/>
 	</label>
@@ -61,6 +63,15 @@ type ResMsg struct {
 	Code int         `json:"code"`
 	Data interface{} `json:"data"`
 	Msg  string      `json:"msg"`
+}
+
+type FileInfo struct {
+	Name      string `json:"name"`
+	ReName    string `json:"rename"`
+	Path      string `json:"path"`
+	Md5       string `json:"md5"`
+	Size      int64  `json:"size"`
+	TimeStamp int64  `json:"timeStamp"`
 }
 
 func ReturnJson(resMsg ResMsg, write ResponseWriter) {
@@ -85,9 +96,12 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 		err          error
 		project      string
 		module       = ""
+		fileInfo     FileInfo
+		fileInfoJson []byte
 		uploadFile   multipart.File
 		uploadHeader *multipart.FileHeader
 		filePath     string
+		fileName     string
 		savePath     string
 		saveFile     *os.File
 	)
@@ -120,13 +134,18 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 		}
 		defer uploadFile.Close()
 		// 2.构造文件存储路径，可以很方便的按照天进行数据同步
+		if rename {
+			fileName = utils.MD5(utils.GetUUID()) + path.Ext(uploadHeader.Filename)
+		} else {
+			fileName = uploadHeader.Filename
+		}
 		timeFmt := time.Unix(time.Now().Unix(), 0).Format("20060102/15/")
 		if len(module) == 0 {
 			filePath = fmt.Sprintf(BaseStoragePath+"%s/%s", project, timeFmt)
-			savePath = fmt.Sprintf(filePath+"%s", uploadHeader.Filename)
+			savePath = fmt.Sprintf(filePath+"%s", fileName)
 		} else {
 			filePath = fmt.Sprintf(BaseStoragePath+"%s/%s/%s", project, module, timeFmt)
-			savePath = fmt.Sprintf(filePath+"%s", uploadHeader.Filename)
+			savePath = fmt.Sprintf(filePath+"%s", fileName)
 		}
 		if _, err = os.Stat(savePath); err == nil { // 判断文件是否存在
 			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，文件名重复"}, writer)
@@ -146,7 +165,18 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，写入文件异常"}, writer)
 			return
 		}
-		// 4.保存文件路径和索引到数据库
+		// 4.构造保存结构
+		fileInfo.Name = uploadHeader.Filename
+		fileInfo.ReName = fileName
+		fileInfo.Path = savePath
+		fileInfo.Md5 = utils.GetFileMd5(saveFile)
+		fileInfo.Size = request.ContentLength
+		fileInfo.TimeStamp = time.Now().UnixNano() / 1e6
+		// 5.保存文件路径和索引到数据库
+		if fileInfoJson, err = json.Marshal(fileInfo); err != nil {
+			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，写入文件异常"}, writer)
+			return
+		}
 		sUrl := compress.GenShortUrl(compress.CharsetRandomAlphanumeric, savePath, func(url, keyword string) bool {
 			data, _ := dbConn.Get([]byte(keyword), nil)
 			if data == nil {
@@ -154,8 +184,8 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 			}
 			return false
 		})
-		err = dbConn.Put([]byte(sUrl), []byte(savePath), nil)
-		// 5.返回文件唯一索引
+		err = dbConn.Put([]byte(sUrl), fileInfoJson, nil)
+		// 6.返回文件唯一索引
 		ReturnJson(ResMsg{Code: 200, Data: sUrl, Msg: "[success]"}, writer)
 		return
 	}
@@ -164,18 +194,21 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 // 下载文件
 func DownloadHandler(writer ResponseWriter, request *Request) {
 	var (
-		err      error
-		filePath []byte
-		file     *os.File
-		fileInfo os.FileInfo
-		fileName string
+		err          error
+		fileInfoJson []byte
+		file         *os.File
+		fileInfo     FileInfo
 	)
 	filePathKey := strings.Replace(request.RequestURI, "/oss/api/v1/download/", "", 1)
-	if filePath, err = dbConn.Get([]byte(filePathKey), nil); err != nil {
+	if fileInfoJson, err = dbConn.Get([]byte(filePathKey), nil); err != nil {
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件路径出现异常"}, writer)
 		return
 	}
-	if file, err = os.Open(utils.Bytes2Str(filePath)); err != nil {
+	if err = json.Unmarshal(fileInfoJson, &fileInfo); err != nil {
+		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件信息出现异常"}, writer)
+		return
+	}
+	if file, err = os.Open(fileInfo.Path); err != nil {
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件出现异常"}, writer)
 		return
 	}
@@ -184,16 +217,10 @@ func DownloadHandler(writer ResponseWriter, request *Request) {
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]文件不存在"}, writer)
 		return
 	}
-	if fileInfo, err = file.Stat(); err != nil {
-		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件失败"}, writer)
-		return
-	}
 	// 设置输出流类型
-	fileName = fileInfo.Name()
-	fileName = url.QueryEscape(fileName)
 	writer.Header().Set("Content-Type", "application/octet-stream")
-	writer.Header().Set("Content-Disposition", "attachment; filename=\""+fileName+"\"")
-	writer.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size(), 10))
+	writer.Header().Set("Content-Disposition", "attachment; filename=\""+url.QueryEscape(fileInfo.Name)+"\"")
+	writer.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size, 10))
 	// 下载文件，默认限速255KB/s
 	bucket := ratelimit.New(defaultRate)
 	buffer := make([]byte, 1024)
@@ -255,18 +282,13 @@ func CreateExampleConfig() {
 }
 
 // 读取配置文件
-func ReadConfig(writer ResponseWriter, request *Request) {
+func SyncConfig() {
 	var (
 		err error
 	)
-	if writer != nil && request != nil {
-		// 上传配置文件，再解析
-		ReturnJson(ResMsg{Code: 200, Data: nil, Msg: "[success]"}, writer)
-		return
-	} else {
-		// 拷贝项目中的配置文件进行解析
-		CreateExampleConfig()
-	}
+	// 拷贝当前目录的配置文件到指定目录
+	CreateExampleConfig()
+	// 解析，读取配置文件内容
 	config, err = toml.LoadFile(ConfigPath + ConfigFileName)
 	if err != nil {
 		fmt.Println("TomlError ", err.Error())
@@ -276,18 +298,18 @@ func ReadConfig(writer ResponseWriter, request *Request) {
 	addr = config.Get("app.addr").(string)
 	defaultRate = config.Get("app.defaultRate").(int64)
 	defaultMaxFileSize = config.Get("app.defaultMaxFileSize").(int64)
+	rename = config.Get("file.rename").(bool)
 	return
 }
 
 func main() {
 	// 读取配置文件
-	ReadConfig(nil, nil)
+	SyncConfig()
 	// 初始化数据库
 	dbConn, _ = leveldb.OpenFile(FileIndexPath, nil)
 	defer dbConn.Close()
 	// 初始化HTTP连接
 	HandleFunc("/oss/upload.html", UploadHtmlHandler)
-	HandleFunc("/oss/api/v1/syncConfig", ReadConfig)
 	HandleFunc("/oss/api/v1/upload", UploadHandler)
 	HandleFunc("/oss/api/v1/download/", DownloadHandler)
 	_ = ListenAndServe(addr, nil)

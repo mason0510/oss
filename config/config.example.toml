@@ -4,4 +4,14 @@
   defaultRate = 262144
   # 默认可上传的最大文件大小（256 << 20）
   defaultMaxFileSize = 268435456
+[backup]
+  # 是否开启集群备份操作
+  open = false
+[file]
+  # 是否对保存文件进行重命名，
+  rename = false
+  # 文件是否去重，默认文件夹下没有同名文件（不会重复写入）
+  distinct = true
+
+
 

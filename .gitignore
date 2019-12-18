@@ -2,6 +2,7 @@
 ### Go template
 # Binaries for programs and plugins
 oss.exe
+oss
 *.exe~
 *.dll
 *.so
