@@ -6,6 +6,7 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/syndtr/goleveldb/leveldb"
 	"io"
+	"io/ioutil"
 	"mime/multipart"
 	. "net/http"
 	_ "net/http/pprof"
@@ -22,10 +23,10 @@ import (
 
 // 不可变参数
 const (
-	FileIndexPath   string = "/home/oss/index/"
-	ConfigPath      string = "/home/oss/config/"
+	FileIndexPath   string = "/Users/houzi/home/oss/index/"
+	ConfigPath      string = "/Users/houzi/home/pandaCapital/oss/config/"
 	ConfigFileName  string = "config.toml"
-	BaseStoragePath string = "/home/oss/storage/"
+	BaseStoragePath string = "/Users/houzi/home/oss/storage/"
 )
 
 // 配置文件参数
@@ -77,6 +78,9 @@ type FileInfo struct {
 func ReturnJson(resMsg ResMsg, write ResponseWriter) {
 	// 返回JSON数据
 	resMsgJson, _ := json.Marshal(resMsg)
+	//打印
+	fmt.Println("string(resMsgJson)")
+	fmt.Println(string(resMsgJson))
 	write.Header().Set("Content-Type", "application/json")
 	_, err := write.Write(resMsgJson)
 	fmt.Println(err)
@@ -155,6 +159,7 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 			_ = os.MkdirAll(filePath, 0775)
 		}
 		// 3.保存文件到本地目录
+		//
 		if saveFile, err = os.Create(savePath); err != nil {
 			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，打开文件异常"}, writer)
 			return
@@ -172,6 +177,9 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 		fileInfo.Md5 = utils.GetFileMd5(saveFile)
 		fileInfo.Size = request.ContentLength
 		fileInfo.TimeStamp = time.Now().UnixNano() / 1e6
+		//打印fileInfo
+		fmt.Println(fileInfo.Path)
+		fmt.Println(fileInfo.Name)
 		// 5.保存文件路径和索引到数据库
 		if fileInfoJson, err = json.Marshal(fileInfo); err != nil {
 			ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]保存文件失败，写入文件异常"}, writer)
@@ -184,7 +192,13 @@ func UploadHandler(writer ResponseWriter, request *Request) {
 			}
 			return false
 		})
+		//打印sUrl
+		fmt.Println(sUrl)
+		// 打印fileInfoJson的详细信息
 		err = dbConn.Put([]byte(sUrl), fileInfoJson, nil)
+		//获取文件信息
+		data, _ := dbConn.Get([]byte(sUrl), nil)
+		fmt.Println(string(data))
 		// 6.返回文件唯一索引
 		ReturnJson(ResMsg{Code: 200, Data: sUrl, Msg: "[success]"}, writer)
 		return
@@ -201,6 +215,8 @@ func DownloadHandler(writer ResponseWriter, request *Request) {
 	)
 	filePathKey := strings.Replace(request.RequestURI, "/oss/api/v1/download/", "", 1)
 	if fileInfoJson, err = dbConn.Get([]byte(filePathKey), nil); err != nil {
+		//打印fileInfoJson
+		fmt.Println("fileInfoJson:", fileInfoJson)
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件路径出现异常"}, writer)
 		return
 	}
@@ -228,6 +244,64 @@ func DownloadHandler(writer ResponseWriter, request *Request) {
 		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]下载文件出现异常"}, writer)
 		return
 	}
+}
+
+// 提供上传到服务器功能 下载到本地
+func GetHandler(writer ResponseWriter, request *Request) {
+	var (
+		err          error
+		fileInfoJson []byte
+		file         *os.File
+		fileInfo     FileInfo
+	)
+	filePathKey := strings.Replace(request.RequestURI, "/Users/houzi/home/oss/api/v1/download/", "", 1)
+	//filePathKey截掉 /oss/api/v1/getJson/
+	filePathKey1 := strings.Replace(filePathKey, "/oss/api/v1/getJson/", "", 1)
+	//打印value
+	fmt.Println("value:", filePathKey1)
+	data, _ := dbConn.Get([]byte(filePathKey1), nil)
+	fmt.Println(string(data))
+	if fileInfoJson, err = dbConn.Get([]byte(filePathKey1), nil); err != nil {
+		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件路径出现异常"}, writer)
+		return
+	}
+	if err = json.Unmarshal(fileInfoJson, &fileInfo); err != nil {
+		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件信息出现异常"}, writer)
+		return
+	}
+	//获取文件信息
+	fmt.Println("fileInfo:", fileInfo.Path)
+	if file, err = os.Open(fileInfo.Path); err != nil {
+		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]读取文件出现异常"}, writer)
+		return
+	}
+	defer file.Close()
+	if file == nil {
+		ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]文件不存在"}, writer)
+		return
+	}
+	//打印文件内容
+	data1, _ := ioutil.ReadAll(file)
+	fmt.Println(string(data1))
+	//返回json
+	s := string(data1)
+	//去掉s中的空格和换行
+	s = strings.Replace(s, " ", "", -1)
+	//ReturnJson(ResMsg{Code: 200, Data: s, Msg: "[success]"}, writer)
+	//直接返回字符串给前端
+	io.WriteString(writer, s)
+
+	// 设置输出流类型
+	//writer.Header().Set("Content-Type", "application/octet-stream")
+	//writer.Header().Set("Content-Disposition", "attachment; filename=\""+url.QueryEscape(fileInfo.Name)+"\"")
+	//writer.Header().Set("Content-Length", strconv.FormatInt(fileInfo.Size, 10))
+	//// 下载文件，默认限速255KB/s
+	//bucket := ratelimit.New(defaultRate)
+	//buffer := make([]byte, 1024)
+	//if _, err = io.CopyBuffer(ratelimit.Writer(writer, bucket), file, buffer); err != nil {
+	//	ReturnJson(ResMsg{Code: 500, Data: nil, Msg: "[error]下载文件出现异常"}, writer)
+	//	return
+	//}
 }
 
 // 同步文件索引
@@ -261,7 +335,7 @@ func CreateExampleConfig() {
 	if !utils.FileExists(ConfigPath) { // 是否需要创建文件夹
 		_ = os.MkdirAll(ConfigPath, 0775)
 	}
-	if exampleConfigFile, err = os.Open("./config/config.example.toml"); err != nil {
+	if exampleConfigFile, err = os.Open("./config/config.toml"); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 		return
@@ -309,8 +383,10 @@ func main() {
 	dbConn, _ = leveldb.OpenFile(FileIndexPath, nil)
 	defer dbConn.Close()
 	// 初始化HTTP连接
+	//{"code":200,"data":"Kf24eA","msg":"[success]"}
 	HandleFunc("/oss/upload.html", UploadHtmlHandler)
 	HandleFunc("/oss/api/v1/upload", UploadHandler)
 	HandleFunc("/oss/api/v1/download/", DownloadHandler)
+	HandleFunc("/oss/api/v1/getJson/", GetHandler)
 	_ = ListenAndServe(addr, nil)
 }
